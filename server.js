@@ -6,22 +6,27 @@ const cors = require("cors");
 const axios = require("axios");
 const cloudinary = require("cloudinary");
 const bodyParser = require("body-parser");
+const streamifier = require("streamifier");
 const SkribbleService = require("./services/SkribbleService");
 const { getSkribbleConfig } = require("./services/SkribbleService");
 const SignatureRequest = require("./models/SignatureRequest");
-const fs = require("fs");
-const path = require("path");
 
 dotenv.config();
 
 // Get polling interval from .env (in minutes), fallback to 5 min
-const LOOP_TIME = (process.env.POLL_INTERVAL_MIN
-  ? parseFloat(process.env.POLL_INTERVAL_MIN)
-  : 5) * 60 * 1000; // convert minutes --> milliseconds
+const LOOP_TIME =
+  (process.env.POLL_INTERVAL_MIN
+    ? parseFloat(process.env.POLL_INTERVAL_MIN)
+    : 5) *
+  60 *
+  1000; // convert minutes --> milliseconds
 
 console.log(`Polling every ${LOOP_TIME / 60000} minutes`);
 
 async function startServer() {
+  const downloadPdf = process.env.SKRIBBLE_DOWNLOAD == "true";
+  console.log("downloadPdf: ", downloadPdf);
+
   const PQueue = (await import("p-queue")).default;
 
   const app = express();
@@ -30,7 +35,7 @@ async function startServer() {
 
   // ------------------- Mongo -------------------
   await mongoose.connect(process.env.MONGO_URI);
-  console.log(" MongoDB connected");
+  console.log("MongoDB connected");
 
   // ------------------- Cloudinary -------------------
   cloudinary.v2.config({
@@ -44,30 +49,32 @@ async function startServer() {
   const queue = new PQueue({ concurrency: 3, intervalCap: 5, interval: 1000 });
   const activeChecks = new Set();
 
-  // ------------------- Cloudinary Upload -------------------
-  async function uploadBufferToCloudinary(localFilePath, publicId) {
-    try {
-      const downloadPdf = process.env.SKRIBBLE_DOWNLOAD;
+  // ------------------- Cloudinary Upload from Buffer -------------------
+  async function uploadBufferToCloudinary(buffer, publicId) {
+    return new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.v2.uploader.upload_stream(
+        {
+          folder: "skribble_signed_docs",
+          public_id: publicId,
+          use_filename: true,
+          unique_filename: false,
+          resource_type: "auto",
+        },
+        (error, result) => {
+          if (error) return reject(error);
 
-      const pdf = await cloudinary.v2.uploader.upload(localFilePath, {
-        folder: "skribble_signed_docs",
-        public_id: publicId,
-        use_filename: true,
-        unique_filename: false,
-        resource_type: "auto", // important for PDFs
-      });
-
-
-      const viewableUrl = downloadPdf
-        ? pdf.secure_url.replace("/upload/", "/upload/fl_attachment:false/")
-        : pdf.url;
-
-      console.log(`Uploaded to Cloudinary: ${viewableUrl}`);
-      return { ...pdf, viewableUrl };
-    } catch (error) {
-      console.error("Cloudinary upload error:", error);
-      throw error;
-    }
+          const viewableUrl = downloadPdf
+            ? result.secure_url.replace(
+                "/upload/",
+                "/upload/fl_attachment:false/"
+              )
+            : result.secure_url;
+          console.log(`Uploaded to Cloudinary: ${viewableUrl}`);
+          resolve({ ...result, viewableUrl });
+        }
+      );
+      streamifier.createReadStream(buffer).pipe(uploadStream);
+    });
   }
 
   // ------------------- Processing Signed PDF Logic -------------------
@@ -96,7 +103,6 @@ async function startServer() {
       const documentId = srResponse.data.document_id;
       if (!documentId) throw new Error("No document_id found for this request");
 
-
       // Download PDF binary directly
       const pdfResponse = await fetch(
         `${skribble.config.baseUrl}/v2/documents/${documentId}/content`,
@@ -113,20 +119,9 @@ async function startServer() {
 
       const signedPdf = Buffer.from(await pdfResponse.arrayBuffer());
 
-      // Save PDF locally
-      const folderPath = path.join(__dirname, "signed_pdfs");
-      if (!fs.existsSync(folderPath))
-        fs.mkdirSync(folderPath, { recursive: true });
-
-      const localFilePath = path.join(folderPath, `${signatureRequestId}.pdf`);
-      await fs.promises.writeFile(localFilePath, signedPdf);
-
-      const stats = fs.statSync(localFilePath);
-      console.log(`Saved local PDF: ${localFilePath} (${stats.size} bytes)`);
-
-      // Upload local file to Cloudinary
+      // Upload directly to Cloudinary
       const uploadRes = await uploadBufferToCloudinary(
-        localFilePath,
+        signedPdf,
         signatureRequestId
       );
 
@@ -147,6 +142,18 @@ async function startServer() {
     res.json({ success: true, message: "Server is running" })
   );
 
+  // get all documents in db
+  app.get("/api/get-all-documents", async (req, res) => {
+    try {
+      const allRequests = await SignatureRequest.find();
+      res.json({ success: true, data: allRequests });
+    } catch (err) {
+      console.error("Error fetching signing requests:", err);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // save documents
   app.post("/api/signing-request", async (req, res) => {
     try {
       const {
@@ -158,6 +165,7 @@ async function startServer() {
         isNewToSwitzerland,
         documentType,
       } = req.body;
+
       if (
         !userName ||
         !userEmail ||
