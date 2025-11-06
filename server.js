@@ -142,6 +142,8 @@ async function startServer() {
     res.json({ success: true, message: "Server is running" })
   );
 
+  app.get("/ping", (_, res) => res.json({ pong: true }));
+
   // get all documents in db
   app.get("/api/get-all-documents", async (req, res) => {
     try {
