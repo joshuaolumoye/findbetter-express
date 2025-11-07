@@ -166,6 +166,7 @@ async function startServer() {
         signingUrl,
         isNewToSwitzerland,
         documentType,
+        userId,
       } = req.body;
 
       if (
@@ -187,6 +188,7 @@ async function startServer() {
         signingUrl,
         isNewToSwitzerland,
         documentType,
+        userId
       });
       await record.save();
       console.log(`Saved signing request: ${record.documentId}`);

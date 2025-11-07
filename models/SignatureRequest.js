@@ -5,6 +5,7 @@ const signatureRequestSchema = new mongoose.Schema(
   {
     userName: { type: String, required: true },
     userEmail: { type: String, required: true },
+    userId: { type: String, required: true, default: "" },
     sessionId: { type: String, required: true },
     documentId: { type: String, required: true },
     signingUrl: { type: String, required: true },
