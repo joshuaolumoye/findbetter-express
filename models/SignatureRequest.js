@@ -18,6 +18,7 @@ const signatureRequestSchema = new mongoose.Schema(
     },
     signedAt: { type: Date },
     pdfPath: { type: String },
+    cancellationPdfPath: { type: String },
   },
   { timestamps: true }
 );

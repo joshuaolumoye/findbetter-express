@@ -167,6 +167,7 @@ async function startServer() {
         isNewToSwitzerland,
         documentType,
         userId,
+        cancellationPdf,
       } = req.body;
 
       if (
@@ -188,8 +189,22 @@ async function startServer() {
         signingUrl,
         isNewToSwitzerland,
         documentType,
-        userId
+        userId,
       });
+
+      // Upload cancellation PDFs if present
+      let cancelUpload;
+      if (cancellationPdf) {
+        const buffer = Buffer.from(cancellationPdf, "base64");
+        cancelUpload = await uploadBufferToCloudinary(
+          buffer,
+          `${applicationDocumentId}_cancellation`
+        );
+        // You can extend the schema to store this separately if you want
+        record.cancellationPdfPath = cancelUpload.viewableUrl;
+        console.log(`Uploaded cancellation PDF for ${userName}`);
+      }
+
       await record.save();
       console.log(`Saved signing request: ${record.documentId}`);
       res.status(201).json({ success: true, data: record });
