@@ -163,7 +163,7 @@ async function startServer() {
   app.get("/ping", (_, res) => res.json({ pong: true }));
 
   // get all documents in db
-  app.get("/api/get-all-documents", async (req, res) => {
+  app.get("/express/api/get-all-documents", async (req, res) => {
     try {
       const allRequests = await SignatureRequest.find();
       res.json({ success: true, data: allRequests });
