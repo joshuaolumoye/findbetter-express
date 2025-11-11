@@ -174,7 +174,7 @@ async function startServer() {
   });
 
   // save documents
-  app.post("/api/signing-request", async (req, res) => {
+  app.post("/express/api/signing-request", async (req, res) => {
     try {
       const {
         userName,
