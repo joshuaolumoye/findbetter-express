@@ -80,16 +80,30 @@ async function startServer() {
   // ------------------- Processing Signed PDF Logic -------------------
   async function processSignedDocument(signatureRequestId) {
     try {
+      // Find the document record
       const doc = await SignatureRequest.findOne({
-        documentId: signatureRequestId,
+        $or: [
+          { documentId: signatureRequestId },
+          { cancellationDocumentId: signatureRequestId },
+        ],
       });
-      if (!doc || doc.status === "signed") return;
+
+      if (!doc) return;
+
+      // Determine if this is a cancellation or main doc
+      const isCancellation = doc.cancellationDocumentId === signatureRequestId;
+
+      // Skip only if this specific doc is already signed
+      if (
+        (isCancellation && doc.cancellationStatus === "signed") ||
+        (!isCancellation && doc.status === "signed")
+      )
+        return;
 
       console.log(`Processing signed document: ${signatureRequestId}`);
 
       const accessToken = await skribble.getAccessToken();
 
-      // Get signature request info --> real document_id
       const srResponse = await axios.get(
         `${skribble.config.baseUrl}/v2/signature-requests/${signatureRequestId}`,
         {
@@ -103,7 +117,6 @@ async function startServer() {
       const documentId = srResponse.data.document_id;
       if (!documentId) throw new Error("No document_id found for this request");
 
-      // Download PDF binary directly
       const pdfResponse = await fetch(
         `${skribble.config.baseUrl}/v2/documents/${documentId}/content`,
         {
@@ -119,18 +132,23 @@ async function startServer() {
 
       const signedPdf = Buffer.from(await pdfResponse.arrayBuffer());
 
-      // Upload directly to Cloudinary
       const uploadRes = await uploadBufferToCloudinary(
         signedPdf,
-        signatureRequestId
+        `${signatureRequestId}${isCancellation ? "_cancellation" : ""}`
       );
 
-      // Update DB
-      doc.status = "signed";
-      doc.signedAt = new Date();
-      doc.pdfPath = uploadRes.viewableUrl;
-      await doc.save();
+      // Save to DB correctly
+      if (isCancellation) {
+        doc.cancellationStatus = "signed";
+        doc.cancellationSignedAt = new Date();
+        doc.cancellationPdfPath = uploadRes.viewableUrl;
+      } else {
+        doc.status = "signed";
+        doc.signedAt = new Date();
+        doc.pdfPath = uploadRes.viewableUrl;
+      }
 
+      await doc.save();
       console.log(`Uploaded & saved document: ${uploadRes.viewableUrl}`);
     } catch (err) {
       console.error(`Error processing ${signatureRequestId}:`, err.message);
@@ -167,7 +185,7 @@ async function startServer() {
         isNewToSwitzerland,
         documentType,
         userId,
-        cancellationPdf,
+        cancellationSigningUrl,
       } = req.body;
 
       if (
@@ -181,6 +199,13 @@ async function startServer() {
           .status(400)
           .json({ success: false, error: "Missing required fields" });
 
+      // Extract cancellationDocumentId from the URL, if present
+      let cancellationDocumentId = null;
+      if (cancellationSigningUrl) {
+        const match = cancellationSigningUrl.match(/view\/([a-z0-9\-]+)\//i);
+        if (match) cancellationDocumentId = match[1];
+      }
+
       const record = new SignatureRequest({
         userName,
         userEmail,
@@ -190,20 +215,10 @@ async function startServer() {
         isNewToSwitzerland,
         documentType,
         userId,
+        cancellationSigningUrl,
+        cancellationStatus: cancellationSigningUrl ? "pending" : null,
+        cancellationDocumentId,
       });
-
-      // Upload cancellation PDFs if present
-      let cancelUpload;
-      if (cancellationPdf) {
-        const buffer = Buffer.from(cancellationPdf, "base64");
-        cancelUpload = await uploadBufferToCloudinary(
-          buffer,
-          `${applicationDocumentId}_cancellation`
-        );
-        // You can extend the schema to store this separately if you want
-        record.cancellationPdfPath = cancelUpload.viewableUrl;
-        console.log(`Uploaded cancellation PDF for ${userName}`);
-      }
 
       await record.save();
       console.log(`Saved signing request: ${record.documentId}`);
@@ -231,37 +246,73 @@ async function startServer() {
 
   // ------------------- Polling -------------------
   async function checkPendingDocuments() {
+    // Fetch pending main documents
     const pendingDocs = await SignatureRequest.find({
       status: { $in: ["pending", "opened"] },
     });
-    if (!pendingDocs.length) return;
 
-    console.log(`Checking ${pendingDocs.length} pending documents...`);
+    // Fetch pending cancellation documents
+    const pendingCancellations = await SignatureRequest.find({
+      cancellationSigningUrl: { $ne: null },
+      cancellationStatus: { $in: ["pending", "opened"] },
+    });
+
+    const docsToCheck = [];
+
+    // Add main docs
     for (const doc of pendingDocs) {
-      if (activeChecks.has(doc.documentId)) continue;
-      activeChecks.add(doc.documentId);
+      docsToCheck.push({
+        ...doc.toObject(),
+        isCancellation: false,
+        checkId: doc.documentId,
+      });
+    }
+
+    // Add cancellation docs
+    for (const doc of pendingCancellations) {
+      if (doc.cancellationDocumentId) {
+        docsToCheck.push({
+          ...doc.toObject(),
+          isCancellation: true,
+          checkId: doc.cancellationDocumentId,
+        });
+      }
+    }
+
+    if (!docsToCheck.length) return;
+
+    console.log(`Checking ${docsToCheck.length} pending documents...`);
+
+    for (const doc of docsToCheck) {
+      if (activeChecks.has(doc.checkId)) continue;
+      activeChecks.add(doc.checkId);
 
       queue.add(async () => {
         try {
-          const statusData = await skribble.getDocumentStatus(doc.documentId);
+          const statusData = await skribble.getDocumentStatus(doc.checkId);
           const currentStatus =
             statusData?.status_overall?.toUpperCase?.() || "UNKNOWN";
 
-          console.log(` ${doc.documentId}: ${currentStatus}`);
+          console.log(` ${doc.checkId}: ${currentStatus}`);
 
           if (["SIGNED", "COMPLETED", "DONE"].includes(currentStatus)) {
-            await processSignedDocument(doc.documentId);
-          } else if (currentStatus === "OPEN" && doc.status !== "opened") {
-            doc.status = "opened";
-            await doc.save();
+            await processSignedDocument(doc.checkId);
+          } else if (
+            (currentStatus === "OPEN" && !doc.isCancellation) ||
+            doc.isCancellation
+          ) {
+            if (!doc.isCancellation) doc.status = "opened";
+            else doc.cancellationStatus = "opened";
+            await SignatureRequest.findByIdAndUpdate(doc._id, doc);
           } else if (["CANCELLED", "DECLINED"].includes(currentStatus)) {
-            doc.status = "cancelled";
-            await doc.save();
+            if (!doc.isCancellation) doc.status = "cancelled";
+            else doc.cancellationStatus = "cancelled";
+            await SignatureRequest.findByIdAndUpdate(doc._id, doc);
           }
         } catch (err) {
-          console.error(`Error checking ${doc.documentId}:`, err.message);
+          console.error(`Error checking ${doc.checkId}:`, err.message);
         } finally {
-          activeChecks.delete(doc.documentId);
+          activeChecks.delete(doc.checkId);
         }
       });
     }
